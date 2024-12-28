@@ -657,6 +657,9 @@ REAL, DIMENSION( ims:ime, kms:kme, jms:jme ),                        &
    double precision, parameter :: ezfairo = -80.00d0
    double precision, parameter :: efa1 = 4.5d-3, efa2 = 3.8d-4, efa3 = 1.0d-4
    double precision, parameter :: efb1 = 0.50, efb2 = 0.65, efb3 = 0.10
+
+   logical, save :: clear_history = .true.
+
 #endif
    integer :: ng =3
 ! End explicit lightning

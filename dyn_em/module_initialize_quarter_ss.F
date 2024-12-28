@@ -1,4 +1,20 @@
+! for GSD version of WRF 3.8
 !IDEAL:MODEL_LAYER:INITIALIZATION
+
+#if ( HYBRID_COORD==1 )
+#  define gridmu_1(...) (grid%c1h(k)*XXPC1HXX(__VA_ARGS__))
+#  define XXPC1HXX(...) grid%mu_1(__VA_ARGS__)
+
+#  define gridMu_1(...) (grid%c1f(k)*XXPC1FXX(__VA_ARGS__))
+#  define XXPC1FXX(...) grid%Mu_1(__VA_ARGS__)
+
+#  define gridmub(...) (grid%c1h(k)*XXPCBHXX(__VA_ARGS__)+grid%c2h(k))
+#  define XXPCBHXX(...) grid%mub(__VA_ARGS__)
+
+#  define gridMub(...) (grid%c1f(k)*XXPCBFXX(__VA_ARGS__)+grid%c2f(k))
+#  define XXPCBFXX(...) grid%Mub(__VA_ARGS__)
+#endif
+
 !
 
 !  This MODULE holds the routines which are used to perform various initializations
@@ -23,6 +39,7 @@ MODULE module_initialize_ideal
    USE module_timing
    USE module_configure
    USE module_init_utilities
+   USE module_soil_pre
 #ifdef DM_PARALLEL
    USE module_dm
 #endif
@@ -54,6 +71,8 @@ CONTAINS
    !  Local data.
    INTEGER :: idum1, idum2
 
+      write(0,*) 'Begin init_domain'
+
    CALL set_scalar_indices_from_config ( head_grid%id , idum1, idum2 )
 
      CALL init_domain_rk( grid &
@@ -61,6 +80,8 @@ CONTAINS
 #include "actual_new_args.inc"
 !
                         )
+
+      write(0,*) 'End init_domain'
 
    END SUBROUTINE init_domain
 
@@ -71,6 +92,7 @@ CONTAINS
 # include "dummy_new_args.inc"
 !
 )
+   USE module_optional_input
    IMPLICIT NONE
 
    !  Input data.
@@ -100,7 +122,7 @@ CONTAINS
    
    
    INTEGER :: nxc=-1, nyc=-1
-   REAL    :: delt = 5.
+   REAL    :: delt = 3.
    real    :: pres, qvs, rh, qvs1
    real    :: zradbub = 1500.
    real    :: xradbub = 10000.
@@ -129,13 +151,32 @@ CONTAINS
    LOGICAL :: stretch_grid, dry_sounding
    logical :: moisten = .false.
 
+   REAL    :: B1, B2, B3, B4, B5, sin_arg
+
+! soil input
+   INTEGER :: ns_input
+   REAL    :: tmn_input, tsk_input
+   REAL    :: zs_input(100),tslb_input(100),smois_input(100)
+
+   REAL    :: zrwa(200), zwa(200)
+
   INTEGER :: xs , xe , ys , ye
-  REAL :: mtn_ht
+  REAL :: mtn_ht = 500.
+  integer :: ido_terrain = 0 ! 1 = mountain, 2 = EW Ridge, 3 = NS Ridge
    LOGICAL, EXTERNAL :: wrf_dm_on_monitor
+   real :: lat = 35.0
+   real :: lon = -95.0
+   integer :: lu_index = 2
+   real :: vegfra = 0.5, canwat = 0.0
+   integer :: isltyp = 4
+   character (len=256) :: mminlu2
+   LOGICAL :: real_soil = .false.
+   logical :: fcoriolis = .false.
 
    NAMELIST /init_ideal/ nxc,nyc,delt,use_eta_levels, &
         ugrid,vgrid,setccn,use_snd_plevels,use_snd_zlevels,numbub,nxb,nyb, &
-        xradbub,yradbub,zradbub,moisten
+        xradbub,yradbub,zradbub,moisten,mtn_ht,ido_terrain,lat,lon,  &
+        lu_index, vegfra, canwat, isltyp, real_soil, fcoriolis
 
    SELECT CASE ( model_data_order )
          CASE ( DATA_ORDER_ZXY )
@@ -183,6 +224,27 @@ CONTAINS
   rewind(15)
   read(15,NML=init_ideal,iostat=istat) ! returning iostat prevents bombing if the namelist does not exist
   close(15)
+
+  open(15,file="namelist.output",status='old',form='formatted',position='append')
+   write(15,NML=init_ideal)
+   write(0,NML=init_ideal)
+  close(15)
+
+  
+  n = 0 
+  IF ( use_eta_levels ) n = n + 1
+  IF ( use_snd_plevels ) n = n + 1
+  IF ( use_snd_zlevels ) n = n + 1
+  
+  IF ( n > 1 ) THEN
+      write(0,*) 'ERROR: Can only have one of these as .true. :'
+      write(0,*) ' use_eta_levels  = ',use_eta_levels
+      write(0,*) ' use_snd_plevels = ',use_snd_plevels
+      write(0,*) ' use_snd_xlevels = ',use_snd_zlevels
+      WRITE( wrf_err_message , * ) 'Can only have one use_xxx_levels as true!  '
+      CALL wrf_error_fatal ( wrf_err_message )
+  ENDIF
+
    
    stretch_grid = .not. ( use_eta_levels .or. use_snd_plevels .or. use_snd_zlevels ) ! .true.
 !   delt = 5.
@@ -193,14 +255,14 @@ CONTAINS
    IF ( nxc <= 0 .and. nxb(1) <= 0) THEN
       nxc = (ide-ids)/3 + 1
       nxb(1) = nxc
- !  ELSE 
- !    nxb(1) = nxc
+   ELSEIF  ( nxc > 0 .and. nxb(1) <= 0) THEN
+     nxb(1) = nxc
    ENDIF
    IF ( nyc <= 0 .and. nyb(1) <= 0 ) THEN
       nyc = (jde-jds)/2 + 1
       nyb(1) = nyc
- !  ELSE
- !     nyb(1) = nyc
+   ELSEIF ( nyc > 0 .and. nyb(1) <= 0 ) THEN
+      nyb(1) = nyc
    ENDIF
 
    CALL model_to_grid_config_rec ( grid%id , model_config_rec , config_flags )
@@ -218,10 +280,19 @@ CONTAINS
    CALL wrf_dm_bcast_bytes( jcm , IWORDSIZE )
 #endif
 
+   IF ( grid%sf_sfclay_physics /= 0 ) THEN
+     mminlu2 = 'USGS'
+     CALL nl_set_mminlu(1, mminlu2)
+    CALL nl_set_iswater(1,16)
+!    CALL nl_set_isice(1,3)
+    CALL nl_get_isice ( grid%id , grid%isice )
+    write(0,*) 'isice = ',grid%isice
+   ELSE
     CALL nl_set_mminlu(1, '    ')
     CALL nl_set_iswater(1,0)
-    CALL nl_set_cen_lat(1,40.)
-    CALL nl_set_cen_lon(1,-105.)
+   ENDIF
+    CALL nl_set_cen_lat(1,lat)
+    CALL nl_set_cen_lon(1,lon)
     CALL nl_set_truelat1(1,0.)
     CALL nl_set_truelat2(1,0.)
     CALL nl_set_moad_cen_lat (1,0.)
@@ -230,12 +301,16 @@ CONTAINS
     CALL nl_set_pole_lat (1,90.)
     CALL nl_set_map_proj(1,0)
 
+    CALL nl_get_iswater(1,grid%iswater)
 
 !  here we initialize data we currently is not initialized 
 !  in the input data
 
     DO j = jts, jte
       DO i = its, ite
+         grid%msft(i,j)     = 1.
+         grid%msfu(i,j)     = 1.
+         grid%msfv(i,j)     = 1.
          grid%msftx(i,j)    = 1.
          grid%msfty(i,j)    = 1.
          grid%msfux(i,j)    = 1.
@@ -247,9 +322,28 @@ CONTAINS
          grid%cosa(i,j)     = 1.
          grid%e(i,j)        = 0.
          grid%f(i,j)        = 0.
-
+         IF ( fcoriolis ) THEN
+           grid%e(i,j)        = 2.0*EOMEG*cos(lat*DEGRAD)
+           grid%f(i,j)        = 2.0*EOMEG*sin(lat*DEGRAD)
+         ENDIF
+         grid%xlat(i,j)     = lat
+         grid%xlong(i,j)    = lon
+         grid%xland(i,j)     = 1.
+         grid%landmask(i,j)  = 1.
+         grid%lu_index(i,j)  = lu_index
       END DO
    END DO
+
+        DO j = jts , MIN(jde-1,jte)
+           DO i = its , MIN(ide-1,ite)
+              grid%vegfra(i,j) = vegfra
+              grid%canwat(i,j) = canwat
+              grid%isltyp(i,j) = isltyp
+              grid%ivgtyp(i,j) = lu_index
+              grid%xice(i,j) = 0.
+              grid%snow(i,j) = 0.
+           END DO
+        END DO
 
     DO j = jts, jte
     DO k = kts, kte
@@ -261,6 +355,81 @@ CONTAINS
 
    grid%step_number = 0
 
+
+      hold_ups = .true. ! need this set to true to initialize the soil on the interior of the domain
+
+   IF ( config_flags%sf_surface_physics /= 0 ) THEN
+   
+   IF ( real_soil ) THEN ! from input file
+
+      IF (config_flags%sf_surface_physics .NE. 2) WRITE (6, *)   &
+         'If using LSM option other than Noah, must edit input_soil file (from test/em_scm_xy)'
+    
+      CALL read_soil(100,ns_input,tmn_input,tsk_input,zs_input,tslb_input,smois_input)
+
+      CALL init_module_optional_input(grid,config_flags)
+      num_st_levels_input = ns_input
+      num_sm_levels_input = ns_input
+      num_sw_levels_input = ns_input
+      DO k = 1,ns_input
+         st_levels_input(k) = zs_input(k)*100.0 ! to cm
+         sm_levels_input(k) = zs_input(k)*100.0 ! to cm
+         sw_levels_input(k) = zs_input(k)*100.0 ! to cm
+         st_input(:,k+1,:) = tslb_input(k)
+         sm_input(:,k+1,:) = smois_input(k)
+         sw_input(:,k+1,:) = smois_input(k)
+        ! grid%tslb(:,k,:) = tslb_input(k)
+         write(6,*) 'tslb_input,smois_input,z: ',k,tslb_input(k),smois_input(k),zs_input(k)
+      ENDDO
+  
+      grid%tsk = tsk_input
+      grid%sst = tsk_input
+      grid%tmn = tmn_input
+
+      flag_soil_layers  = 0 ! go ahead and put skin temp in
+      flag_soil_levels  = 0 ! go ahead and put skin moisture in
+      flag_sst          = 0 ! don't modify for ocean
+      flag_tavgsfc      = 0 
+      flag_soilhgt      = 0 
+
+      CALL process_soil_real ( grid%tsk , grid%tmn , grid%tavgsfc, &
+                   grid%landmask , grid%sst , grid%ht, grid%toposoil, &
+                   st_input , sm_input , sw_input , &
+                   st_levels_input , sm_levels_input , sw_levels_input , &
+                   grid%zs , grid%dzs , grid%tslb , grid%smois , grid%sh2o , &
+                   flag_sst , flag_tavgsfc, flag_soilhgt, flag_soil_layers, flag_soil_levels,  &
+                   ids , ide , jds , jde , kds , kde , &
+                   ims , ime , jms , jme , kms , kme , &
+                   its , ite , jts , jte , kts , kte , &
+                   model_config_rec%sf_surface_physics(grid%id) , &
+                   model_config_rec%num_soil_layers , &
+                   model_config_rec%real_data_init_type , &
+                   num_st_levels_input , num_sm_levels_input , num_sw_levels_input , &
+                   num_st_levels_alloc , num_sm_levels_alloc , num_sw_levels_alloc )
+
+       write(6,*) 'size of tslb',size(grid%tslb,1),size(grid%tslb,2),size(grid%tslb,3)
+       DO k=1,ns_input
+       write(6,*) 'tslb in center:',k,grid%tslb(ite/2,k,jte/2)
+         IF ( grid%tslb(ite/2,k,jte/2) < 200. ) THEN
+           grid%tslb(:,k,:) = 298.0
+         ENDIF
+       ENDDO
+   
+   ELSE ! ideal soil
+! Process the soil; note that there are some things hard-wired into share/module_soil_pre.F
+      CALL process_soil_ideal(grid%xland,grid%xice,grid%vegfra,grid%snow,grid%canwat, &
+                     grid%ivgtyp,grid%isltyp,grid%tslb,grid%smois, &
+                     grid%tsk,grid%tmn,grid%zs,grid%dzs,model_config_rec%num_soil_layers, &
+                     model_config_rec%sf_surface_physics(grid%id), &
+                                   ids,ide, jds,jde, kds,kde,&
+                                   ims,ime, jms,jme, kms,kme,&
+                                   its,ite, jts,jte, kts,kte )
+
+    ENDIF
+    
+    ENDIF
+
+
 ! set up the grid
 
    IF (stretch_grid) THEN ! exponential stretch for eta (nearly constant dz)
@@ -271,15 +440,19 @@ CONTAINS
    ELSE
 
     IF ( use_snd_plevels .or. use_snd_zlevels ) THEN
+    dry_sounding = .false.
     CALL get_sounding( zk, p_in, pd_in, theta, rho, u, v, qv, etal, dry_sounding, nl_max, nl_in )
      grid%znw(1) = 1.0
      write(6,*) 'eta levels:'
-     write(6,*) 'k, eta'
+     write(6,*) 'k, eta, delta-eta'
      write(6,*) 1,grid%znw(1)
-     DO k=2, kde
+     DO k=2, kde-1
       grid%znw(k) = 0.5*( etal(k) + etal(k+1) )
      write(6,*) k,grid%znw(k)
      ENDDO
+     k = kde
+     grid%znw(k) = etal(k+1) ! use the added top w-point for model top
+     write(6,*) k,grid%znw(k)
      
       write(6,"( 5(f10.7,',',1x))") (grid%znw(k), k=1,kde)
     
@@ -303,7 +476,7 @@ CONTAINS
    ENDDO
 
    IF ( config_flags%hybrid_opt .NE. 0 ) THEN
-      call wrf_error_fatal ( '--- ERROR: Hybrid Vertical Coordinate option not supported with this idealized case' )
+!      call wrf_error_fatal ( '--- ERROR: Hybrid Vertical Coordinate option not supported with this idealized case' )
    END IF
    grid%hybrid_opt = 0
 
@@ -367,6 +540,97 @@ CONTAINS
     write(6,*) 'ptop,p_top_requested,p_in(nl_in) = ',grid%p_top,grid%p_top_requested,p_in(nl_in)
   ENDIF
 
+!  Fill in the hybrid coordinate coefficients
+
+   DO k=1, kde
+      IF      ( config_flags%hybrid_opt .EQ. 0 ) THEN
+         grid%c3f(k) = grid%znw(k)
+      ELSE IF ( config_flags%hybrid_opt .EQ. 1 ) THEN
+         grid%c3f(k) = grid%znw(k)
+      ELSE IF ( config_flags%hybrid_opt .EQ. 2 ) THEN
+         B1 = 2. * grid%etac**2 * ( 1. - grid%etac )
+         B2 = -grid%etac * ( 4. - 3. * grid%etac - grid%etac**3 )
+         B3 = 2. * ( 1. - grid%etac**3 )
+         B4 = - ( 1. - grid%etac**2 )
+         B5 = (1.-grid%etac)**4
+         grid%c3f(k) = ( B1 + B2*grid%znw(k) + B3*grid%znw(k)**2 + B4*grid%znw(k)**3 ) / B5
+         IF ( grid%znw(k) .LT. grid%etac ) THEN
+            grid%c3f(k) = 0.
+         END IF
+         IF ( k .EQ. kds ) THEN
+            grid%c3f(k) = 1.
+         ELSE IF ( k .EQ. kde ) THEN
+            grid%c3f(k) = 0.
+         END IF
+      ELSE IF ( config_flags%hybrid_opt .EQ. 3 ) THEN
+         IF ( grid%znw(k) .GE. grid%etac ) THEN
+            sin_arg = (1./(1.-grid%etac))*(grid%znw(k)-1.)+1
+            grid%c3f(k) = (sin(sin_arg*3.14159265358/2.))**2
+         ELSE
+            grid%c3f(k) = 0.
+         END IF
+         IF ( k .EQ. kds ) THEN
+            grid%c3f(k) = 1.
+         ELSE IF ( k .EQ. kds ) THEN
+            grid%c3f(kde) = 0.
+         END IF
+      ELSE
+         CALL wrf_error_fatal ( 'ERROR: --- hybrid_opt=0 ===> Standard WRF Coordinate; hybrid_opt>=1 ===> Hybrid Vertical Coordinate' )
+      END IF
+   END DO
+
+   DO k=1, kde
+      grid%c4f(k) = ( grid%znw(k) - grid%c3f(k) ) * ( p1000mb - grid%p_top )
+   ENDDO
+
+   !  Now on half levels, just add up and divide by 2 (for c3h).  Use (eta-c3)*(p00-pt) for c4 on half levels.
+
+   DO k=1, kde-1
+      grid%c3h(k) = ( grid%c3f(k+1) + grid%c3f(k) ) * 0.5
+      grid%c4h(k) = ( grid%znu(k) - grid%c3h(k) ) * ( p1000mb - grid%p_top )
+   ENDDO
+
+   !  c1 = d(B)/d(eta).  We define c1f as c1 on FULL levels.  For a vertical difference,
+   !  we need to use B and eta on half levels.  The k-loop ends up referring to the 
+   !  full levels, neglecting the top and bottom.
+
+   DO k=kds+1, kde-1
+      grid%c1f(k) = ( grid%c3h(k) - grid%c3h(k-1) ) / ( grid%znu(k) - grid%znu(k-1) )
+   ENDDO
+
+   !  The boundary conditions to get the coefficients:
+   !  1) At k=kts: define d(B)/d(eta) = 1.  This gives us the same value of B and d(B)/d(eta)
+   !     when doing the sigma-only B=eta.
+   !  2) At k=kte: with the new vertical coordinate, define d(B)/d(eta) = 0.  The curve B SMOOTHLY 
+   !     goes to zero, and at the very top, B continues to SMOOTHLY go to zero.  Note that for 
+   !     almost all cases of non B=eta, B is ALREADY=ZERO at the top, so this is a reasonable BC to 
+   !     assume.
+   !  3) At k=kte: when trying to mimic the original vertical coordinate, since B = eta, then
+   !     d(B)/d(eta) = 1.
+
+   grid%c1f(kds) = 1.
+   IF      ( ( config_flags%hybrid_opt .EQ. 0 ) .OR. ( config_flags%hybrid_opt .EQ. 1 ) ) THEN
+      grid%c1f(kde) = 1.
+   ELSE
+      grid%c1f(kde) = 0.
+   END IF
+
+   !  c2 = ( 1. - c1(k) ) * (p00 - pt).  There is no vertical differencing, so we can do the
+   !  full kds to kde looping.
+
+   DO k=kds, kde
+      grid%c2f(k) = ( 1. - grid%c1f(k) ) * ( p1000mb - grid%p_top )
+   END DO
+
+   !  Now on half levels for c1 and c2.  The c1h will result from the full level c3 and full
+   !  level eta differences.  The c2 value use the half level c1(k).
+
+   DO k=1, kde-1
+      grid%c1h(k) = ( grid%c3f(k+1) - grid%c3f(k) ) / ( grid%znw(k+1) - grid%znw(k) )
+      grid%c2h(k) = ( 1. - grid%c1h(k) ) * ( p1000mb - grid%p_top )
+   END DO
+
+
   IF ( use_snd_plevels .or. use_snd_zlevels ) grid%p_top = p_in(nl_in)
 
   DO j=jts,jte
@@ -380,8 +644,8 @@ CONTAINS
   xe=xs + 6
   ys=jde/2 -3
   ye=ys + 6
-  mtn_ht = 500
-#ifdef MTN
+  ! mtn_ht = 500
+  IF ( ido_terrain == 1 ) THEN ! MTN
   DO j=max(ys,jds),min(ye,jde-1)
   DO i=max(xs,ids),min(xe,ide-1)
      grid%ht(i,j) = mtn_ht * 0.25 * &
@@ -389,23 +653,27 @@ CONTAINS
                ( 1. + COS ( 2*pi/(ye-ys) * ( j-ys ) + pi ) )
   ENDDO
   ENDDO
-#endif
-#ifdef EW_RIDGE
+  endif
+
+  IF ( ido_terrain == 2 ) THEN !  EW_RIDGE
   DO j=max(ys,jds),min(ye,jde-1)
   DO i=ids,ide
      grid%ht(i,j) = mtn_ht * 0.50 * &
                ( 1. + COS ( 2*pi/(ye-ys) * ( j-ys ) + pi ) )
   ENDDO
   ENDDO
-#endif
-#ifdef NS_RIDGE
+  endif
+  
+  
+  IF ( ido_terrain ==3 ) THEN ! NS_RIDGE
   DO j=jds,jde
   DO i=max(xs,ids),min(xe,ide-1)
      grid%ht(i,j) = mtn_ht * 0.50 * &
                ( 1. + COS ( 2*pi/(xe-xs) * ( i-xs ) + pi ) )
   ENDDO
   ENDDO
-#endif
+  endif
+
   DO j=jts,jte
   DO i=its,ite
     grid%phb(i,1,j) = g * grid%ht(i,j)
@@ -423,7 +691,12 @@ CONTAINS
 !  interp theta (from interp) and compute 1/rho from eqn. of state
 
     DO K = 1, kte-1
+!      p_level = grid%znu(k)*(p_surf - grid%p_top) + grid%p_top
+#if  !( HYBRID_COORD==1 )
       p_level = grid%znu(k)*(p_surf - grid%p_top) + grid%p_top
+#elif ( HYBRID_COORD==1 )
+      p_level = grid%c3h(k)*(p_surf - grid%p_top) + grid%c4h(k) + grid%p_top
+#endif
       grid%pb(i,k,j) = p_level
       grid%t_init(i,k,j) = interp_0( theta, p_in, p_level, nl_in ) - t0
       grid%alb(i,k,j) = (r_d/p1000mb)*(grid%t_init(i,k,j)+t0)*(grid%pb(i,k,j)/p1000mb)**cvpm
@@ -442,7 +715,12 @@ CONTAINS
 
   IF ( wrf_dm_on_monitor() ) THEN
     write(6,*) ' ptop is ',grid%p_top
-    write(6,*) ' base state grid%mub(1,1), p_surf is ',grid%mub(1,1),grid%mub(1,1)+grid%p_top
+!    write(6,*) ' base state grid%mub(1,1), p_surf is ',grid%mub(1,1),grid%mub(1,1)+grid%p_top
+#if  !( HYBRID_COORD==1 )
+  write(6,*) ' base state grid%mub(1,1), p_surf is ',grid%mub(1,1),grid%mub(1,1)+grid%p_top
+#elif ( HYBRID_COORD==1 )
+  write(6,*) ' base state grid%MUB(1,1), p_surf is ',grid%MUB(1,1),grid%c3f(kts)*grid%MUB(1,1)+grid%c4f(kts)+grid%p_top
+#endif
   ENDIF
 
 !  calculate full state for each column - this includes moisture.
@@ -470,7 +748,12 @@ CONTAINS
 
     do k=1,kde-1
 
+!      p_level = grid%znu(k)*(pd_surf - grid%p_top) + grid%p_top
+#if  !( HYBRID_COORD==1 )
       p_level = grid%znu(k)*(pd_surf - grid%p_top) + grid%p_top
+#elif ( HYBRID_COORD==1 )
+      p_level = grid%c3h(k)*(pd_surf - grid%p_top) + grid%c4h(k) + grid%p_top
+#endif
 
       moist(i,k,j,P_QV) = interp_0( qv, pd_in, p_level, nl_in )
       grid%t_1(i,k,j)          = interp_0( theta, pd_in, p_level, nl_in ) - t0
@@ -676,7 +959,12 @@ CONTAINS
     p_surf = interp_0( p_in, zk, z_at_v, nl_in )
 
     DO K = 1, kte-1
+!      p_level = grid%znu(k)*(p_surf - grid%p_top) + grid%p_top
+#if  !( HYBRID_COORD==1 )
       p_level = grid%znu(k)*(p_surf - grid%p_top) + grid%p_top
+#elif ( HYBRID_COORD==1 )
+      p_level = grid%c3h(k)*(p_surf - grid%p_top) + grid%c4h(k) + grid%p_top
+#endif
       grid%v_1(i,k,j) = interp_0( v, p_in, p_level, nl_in )
       grid%v_2(i,k,j) = grid%v_1(i,k,j)
     ENDDO
@@ -778,6 +1066,8 @@ CONTAINS
   grid%traj_k    = -9999
   grid%traj_lat  = -9999
   grid%traj_long = -9999
+  grid%xlat(its:ite,jts:jte) = lat
+  grid%xlong(its:ite,jts:jte) = lon
    
   IF (config_flags%num_traj .gt. 0 .and. config_flags%traj_opt .gt. 0) THEN
      icount = 1
@@ -807,7 +1097,7 @@ CONTAINS
      END DO 
   END IF
 
-
+     write(0,*) 'End of init_domain_rk'
 
  END SUBROUTINE init_domain_rk
 
@@ -905,6 +1195,9 @@ CONTAINS
       if(debug) then
         write(6,*) ' surface density is ',rho_surf
         write(6,*) ' surface pi is      ',pi_surf
+        write(6,*) ' th_surf,qvf,p_surf = ',th_surf,qvf,p_surf
+        write(6,*) ' rvovrd,r,cvpm,cp = ',rvovrd,r,cvpm,cp
+        write(6,*) ' dry = ',dry
       end if
 
 
@@ -954,8 +1247,12 @@ CONTAINS
 
           IF ( use_snd_zlevels ) THEN
             etal(1) = 1.
+            write(6,*) 'readsnd: k,eta_level'
+            k = 1
+            write(6,*) k,etal(k)
             do k=2,nl
               etal(k) = (pm_input(k) - pm_input(nl))/(pm_input(1) - pm_input(nl))
+              write(6,*) k,etal(k)
             enddo
           ENDIF
 
@@ -1027,7 +1324,7 @@ CONTAINS
       ps = ps*pfac
       if(debug) then
         write(6,*) ' input sounding surface parameters '
-        write(6,*) ' surface pressure (mb) ',ps*pfac
+        write(6,*) ' surface pressure (mb) ',ps
         write(6,*) ' surface pot. temp (K) ',ts
         write(6,*) ' surface mixing ratio (g/kg) ',qvs
       end if
@@ -1062,6 +1359,22 @@ CONTAINS
  110    continue
       enddo
 
+        IF ( use_snd_zlevels ) THEN ! reading in a commas-produced sounding
+                                    ! Sounding has surface (w-point) and then 
+                                    ! scalar points, so we need to fake a top
+                                    ! w-point to use as eta level 0
+        h(k+1) = h(k) + 0.5*(h(k)-h(k-1))
+        th(k+1) = th(k) + 0.5*(th(k)-th(k-1))
+        
+        k = k+1
+        u(k) = u(k-1)
+        v(k) = v(k-1)
+        qv(k) = qv(k-1)
+
+        if(debug) write(6,'(1x,i3,5(1x,e10.3))') k, h(k), th(k), qv(k), u(k), v(k)
+        
+       ENDIF
+
       ENDIF
 
       nl = k
@@ -1069,5 +1382,49 @@ CONTAINS
       close(unit=10,status = 'keep')
 
       end subroutine read_sounding
+
+!-------------------------------------------------------
+
+      subroutine read_soil( n,nl,tmn,tsk,zs,tslb,smois )
+      implicit none
+      integer n,nl
+      real tmn,tsk
+      real zs(n),tslb(n),smois(n)
+      logical end_of_file
+      logical debug 
+
+      integer k
+    
+      debug = .true.
+
+      open(unit=11,file='input_soil',form='formatted',status='old')
+      rewind(11)
+
+      read(11,*) zs(1),tmn,tsk
+
+      if(debug) then
+        write(6,*) ' input deep soil temperature (K) ',tmn
+        write(6,*) ' input skin temperature (K) ',tsk
+      end if
+
+      end_of_file = .false.
+      k = 0
+
+      do while (.not. end_of_file)
+
+        read(11,*,end=100) zs(k+1), tslb(k+1), smois(k+1)
+        k = k+1
+        if(debug) write(6,'(1x,i3,3(1x,f16.7))') k, zs(k), tslb(k), smois(k)
+        go to 110
+ 100    end_of_file = .true.
+ 110    continue
+      enddo
+
+      nl = k
+
+      close(unit=11,status = 'keep')
+
+      end subroutine read_soil
+
 
 END MODULE module_initialize_ideal
